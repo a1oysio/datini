@@ -1,0 +1,14 @@
+{
+  "name": "Prodotti olivicoli di Foggia",
+  "place": "Foggia",
+  "publisher": "Camera di Commercio di Foggia",
+  "source_url": "https://www.fg.camcom.gov.it/servizi/storico-dei-listini-settimanali",
+  "license": "Listini pubblici della Camera di Commercio di Foggia, riutilizzabili citando la fonte",
+  "description": "Listino settimanale dei prezzi all'ingrosso dei prodotti olivicoli rilevati il mercoledì dalla Borsa Merci di Foggia: olio extravergine, vergine e lampante, olio biologico, IGP Puglia e DOP Dauno, olive da olio e da mensa per varietà. Dall'ottobre 2024.",
+  "notes": [
+    "L'olio è in euro al chilo, le olive in euro al quintale (100 kg), I.V.A. esclusa.",
+    "Le olive da olio e da mensa si quotano solo da ottobre a gennaio: nel resto dell'anno le loro righe sono vuote.",
+    "Le voci sono quelle del listino, scritte come le scrive la borsa.",
+    "Lettura automatica dei PDF: il riferimento ufficiale resta il listino pubblicato dalla Camera di Commercio di Foggia."
+  ]
+}

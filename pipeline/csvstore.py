@@ -1,0 +1,279 @@
+"""Lettura e scrittura del dataset CSV.
+
+Unico punto in cui si scrivono i CSV.  Sia l'aggiornamento incrementale
+(``pipeline.update``) sia la ricostruzione integrale (``pipeline.rebuild``)
+passano di qui: gli stessi dati devono dare gli stessi file, qualunque strada
+abbiano preso.  Quando i due percorsi avevano ciascuno la propria scrittura,
+divergevano gia' sulla definizione di "quotato".
+"""
+from __future__ import annotations
+
+import csv
+import json
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from pipeline import paths
+
+PRICE_HEADER = ["date", "code", "low", "high"]
+PRODUCT_HEADER = [
+    "code", "name", "category_path", "unit",
+    "first_date", "last_date", "n_observations", "n_quoted",
+]
+REVISION_HEADER = [
+    "detected_at", "issue", "date", "code",
+    "low_old", "high_old", "low_new", "high_new",
+]
+
+
+@dataclass
+class Product:
+    code: str
+    name: str
+    category_path: str
+    unit: str
+
+
+def sort_key(code: str) -> tuple[int, str]:
+    """I codici Verona sono numerici: ordinali come numeri, non come stringhe."""
+    return (int(code), "") if code.isdigit() else (10**9, code)
+
+
+def fmt(value: Optional[float]) -> str:
+    return "" if value is None else f"{value:.10g}"
+
+
+def parse(value: str) -> Optional[float]:
+    return float(value) if value else None
+
+
+def read_prices(prices_dir: Path) -> dict[tuple[str, str], tuple[Optional[float], ...]]:
+    """Tutti i prezzi indicizzati per (data, codice).
+
+    I valori sono le colonne dopo ``date`` e ``code``, nell'ordine del file:
+    (low, high) per le borse, i quattro prezzi per i petroliferi.
+    """
+    out: dict[tuple[str, str], tuple[Optional[float], ...]] = {}
+    if not prices_dir.is_dir():
+        return out
+    for f in sorted(prices_dir.glob("*.csv")):
+        with f.open(encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            cols = reader.fieldnames[2:]
+            for row in reader:
+                out[(row["date"], row["code"])] = tuple(parse(row[c]) for c in cols)
+    return out
+
+
+def add_product(products: dict[str, "Product"], rec, average: bool) -> None:
+    """Anagrafica del prodotto da un record del parser.
+
+    Comanda il listino: il bollettino delle medie aggiunge un prodotto solo se
+    nessun listino l'ha ancora descritto, altrimenti nome e categoria
+    cambierebbero secondo quale dei due e' stato letto per ultimo.
+    """
+    product = Product(rec.product_code, rec.product_name,
+                      " > ".join(rec.category_path), rec.units)
+    if average:
+        products.setdefault(rec.product_code, product)
+    else:
+        products[rec.product_code] = product
+
+
+def read_products(path: Path) -> dict[str, Product]:
+    out: dict[str, Product] = {}
+    if not path.exists():
+        return out
+    with path.open(encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            out[row["code"]] = Product(
+                row["code"], row["name"], row["category_path"], row["unit"]
+            )
+    return out
+
+
+def write_prices(prices_dir: Path, prices: dict, header: list[str] = PRICE_HEADER) -> dict[str, int]:
+    by_year = defaultdict(list)
+    for (d, code), values in prices.items():
+        by_year[d[:4]].append((d, code, values))
+
+    prices_dir.mkdir(parents=True, exist_ok=True)
+    for stale in prices_dir.glob("*.csv"):
+        if stale.stem not in by_year:
+            stale.unlink()
+
+    counts = {}
+    for year, items in sorted(by_year.items()):
+        # Ordine deterministico: gli stessi dati producono lo stesso file byte per
+        # byte, quindi git non registra diff spuri.
+        items.sort(key=lambda r: (r[0], sort_key(r[1])))
+        with (prices_dir / f"{year}.csv").open("w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh, lineterminator="\n")
+            w.writerow(header)
+            for d, code, values in items:
+                w.writerow([d, code, *map(fmt, values)])
+        counts[year] = len(items)
+    return counts
+
+
+def write_products(path: Path, products: dict[str, Product], prices: dict) -> int:
+    agg = defaultdict(lambda: {"dates": [], "quoted": 0})
+    for (d, code), values in prices.items():
+        a = agg[code]
+        a["dates"].append(d)
+        if any(v is not None for v in values):
+            a["quoted"] += 1
+
+    rows = []
+    for code in sorted(products, key=sort_key):
+        p = products[code]
+        a = agg.get(code)
+        dates = sorted(a["dates"]) if a else []
+        rows.append([
+            p.code, p.name, p.category_path, p.unit,
+            dates[0] if dates else "", dates[-1] if dates else "",
+            len(dates), a["quoted"] if a else 0,
+        ])
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerow(PRODUCT_HEADER)
+        w.writerows(rows)
+    return len(rows)
+
+
+def append_revisions(path: Path, rows: list[list], header: list[str] = REVISION_HEADER) -> int:
+    """Aggiunge al registro le rettifiche che la fonte ha fatto su bollettini gia'
+    acquisiti.
+
+    Il registro si scrive in coda, non si riscrive: il diff in git resta di poche
+    righe, e la storia di cosa e' cambiato -- e di quando ce ne siamo accorti --
+    non si perde.
+    """
+    if not rows:
+        return 0
+    header_needed = not path.exists()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        if header_needed:
+            w.writerow(header)
+        w.writerows(rows)
+    return len(rows)
+
+
+def count_revisions(path: Path) -> int:
+    if not path.exists():
+        return 0
+    with path.open(encoding="utf-8") as fh:
+        return max(0, sum(1 for _ in fh) - 1)
+
+
+def write_meta(path: Path, prices: dict, n_products: int,
+               counts: dict[str, int], last_issue: Optional[int],
+               n_averages: int = 0, exchange=None) -> None:
+    """``exchange`` e' il modulo della borsa (con CODE, NAME, SOURCE_URL); senza,
+    vale Verona."""
+    code, name, url = ((exchange.CODE, exchange.NAME, exchange.SOURCE_URL) if exchange
+                       else (paths.EXCHANGE_CODE, paths.EXCHANGE_NAME, paths.SOURCE_URL))
+    license = getattr(exchange, "LICENSE", "CC-BY-4.0") if exchange else "CC-BY-4.0"
+    dates = sorted({d for d, _ in prices})
+    quoted = sum(1 for values in prices.values() if any(v is not None for v in values))
+    path.write_text(json.dumps({
+        "exchange_code": code,
+        "exchange_name": name,
+        "source_url": url,
+        # La licenza la dichiara la borsa: quella di Verona e' nota, per le
+        # altre vale cio' che dice il loro modulo, anche "non verificata" (None).
+        "license": license,
+        "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "last_issue_number": last_issue,
+        "first_date": dates[0] if dates else None,
+        "last_date": dates[-1] if dates else None,
+        "n_products": n_products,
+        "n_observations": len(prices),
+        "n_quoted": quoted,
+        "n_averages": n_averages,
+        "n_revisions": count_revisions(path.parent / "revisions.csv"),
+        "observations_per_year": counts,
+    }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_datapackage(path.parent, name, url, license)
+
+
+def write_datapackage(dataset: Path, title: str, source_url: str, license: Optional[str]) -> None:
+    (dataset / "datapackage.json").write_text(
+        json.dumps(datapackage(dataset, title, source_url, license),
+                   indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+# Il significato delle colonne, per datapackage.json.  Chi ne aggiunge una la
+# descrive qui: validate segnala le colonne senza descrizione.
+FIELDS = {
+    "date": ("date", "Data della rilevazione"),
+    "code": ("string", "Codice del prodotto: della fonte a Verona, assegnato dal progetto a Bologna"),
+    "low": ("number", "Prezzo minimo; vuoto = non quotato"),
+    "high": ("number", "Prezzo massimo; vuoto = non quotato"),
+    "price": ("number", "Prezzo netto, senza accisa ne' IVA"),
+    "price_with_excise": ("number", "Prezzo con accisa, senza IVA"),
+    "vat_rate": ("number", "Aliquota IVA in percento"),
+    "consumer_price": ("number", "Prezzo al consumo, accisa e IVA incluse"),
+    "name": ("string", "Nome del prodotto, come scritto nel listino"),
+    "category_path": ("string", "Categorie del listino, dalla piu' generale, separate da ' > '"),
+    "unit": ("string", "Unita' di misura del prezzo (EUR/t, EUR/kg, EUR/L, ...)"),
+    "first_date": ("date", "Prima rilevazione del prodotto"),
+    "last_date": ("date", "Ultima rilevazione del prodotto"),
+    "n_observations": ("integer", "Righe del prodotto in prices/"),
+    "n_quoted": ("integer", "Righe con almeno un prezzo"),
+    "detected_at": ("datetime", "Quando la pipeline ha visto la rettifica"),
+    "issue": ("integer", "Numero del bollettino rettificato"),
+}
+
+
+def datapackage(dataset: Path, title: str, source_url: str, license: Optional[str]) -> dict:
+    """Il descrittore Frictionless Data Package della borsa: quali file ci sono e
+    che tipo ha ogni colonna.  Si ricava dai file stessi, cosi' un anno nuovo in
+    prices/ entra da solo; ``pipeline.validate`` controlla che sia aggiornato."""
+    def schema(sample: Path) -> dict:
+        with sample.open(encoding="utf-8") as fh:
+            header = next(csv.reader(fh))
+        fields = []
+        for col in header:
+            base = col.removesuffix("_old").removesuffix("_new")
+            kind, desc = FIELDS.get(base, ("string", ""))
+            if col != base:
+                desc = f"{desc} ({'prima' if col.endswith('_old') else 'dopo'} la rettifica)"
+            fields.append({"name": col, "type": kind, "description": desc})
+        return {"fields": fields, "missingValues": [""]}
+
+    def resource(name: str, files: list[Path], desc: str) -> dict:
+        rel = [f.relative_to(dataset).as_posix() for f in files]
+        return {"name": name, "path": rel if len(rel) > 1 else rel[0], "format": "csv",
+                "encoding": "utf-8", "description": desc, "schema": schema(files[0])}
+
+    resources = [resource("products", [dataset / "products.csv"], "Anagrafica dei prodotti")]
+    for name, desc in (("prices", "Quotazioni, un file per anno"),
+                       ("averages", "Medie quindicinali pubblicate dalla borsa")):
+        files = sorted((dataset / name).glob("*.csv"))
+        if files:
+            resources.append(resource(name, files, desc))
+    if (dataset / "revisions.csv").exists():
+        resources.append(resource("revisions", [dataset / "revisions.csv"],
+                                  "Valori corretti dalla fonte dopo la prima pubblicazione"))
+    lic = ({"name": license, "path": "https://creativecommons.org/licenses/by/4.0/"}
+           if license == "CC-BY-4.0" else {"title": license or "non verificata"})
+    return {
+        "name": f"datini-{dataset.name}",
+        "title": title,
+        "homepage": "https://github.com/a1oysio/datini",
+        "licenses": [lic],
+        "sources": [{"title": title, "path": source_url}],
+        "resources": resources,
+    }
+
+
+def read_meta(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}

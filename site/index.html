@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Datini — i prezzi delle borse merci agricole italiane</title>
+<meta name="description" content="Serie storiche dei prezzi dei prodotti agricoli delle borse merci italiane, aggiornate automaticamente e disponibili in CSV.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <div>
+    <h1><a href="./">Datini</a></h1>
+    <div class="sub">I prezzi delle borse merci agricole. Serie storiche in CSV, aggiornate in automatico. Dati non ufficiali.</div>
+  </div>
+  <nav>
+    <a id="nav-csv" href="https://github.com/a1oysio/datini/tree/main/dataset">Scarica i CSV</a>
+    <a id="nav-bulk" hidden>Tutta la borsa in un file</a>
+    <a href="https://github.com/a1oysio/datini">Codice</a>
+    <a id="nav-source" hidden>Fonte</a>
+  </nav>
+</header>
+
+<!-- Prima pagina: l'elenco delle borse. -->
+<section id="home" hidden>
+  <h2>Scegli una borsa merci</h2>
+  <div id="exchanges"></div>
+</section>
+
+<!-- Una borsa (?b=<nome>): catalogo a sinistra, scheda del prodotto a destra. -->
+<div id="exchange" hidden>
+<div class="crumbs"><a href="./">Borse</a> &gt; <b id="exchange-name"></b></div>
+<section class="stats" id="stats"></section>
+
+<div class="layout">
+  <aside>
+    <div class="filters">
+      <input id="q" type="search" placeholder="Cerca un prodotto…" autocomplete="off">
+      <select id="group"><option value="">Tutti i comparti</option></select>
+      <select id="unit"><option value="">Tutte le unità</option></select>
+      <label><input type="checkbox" id="live" checked> Solo le voci del listino in corso</label>
+      <div id="count"></div>
+    </div>
+    <div id="list" role="listbox" aria-label="Prodotti"></div>
+  </aside>
+
+  <main>
+    <div id="empty">
+      <div id="about"></div>
+      <p class="hint">Scegli un prodotto dall'elenco per vederne la serie storica.</p>
+    </div>
+    <div id="detail" hidden>
+      <button id="back" type="button">← Torna all'elenco</button>
+      <h2 id="title"></h2>
+      <div id="crumb"></div>
+      <div class="toolbar">
+        <button data-range="1" aria-pressed="false">1 anno</button>
+        <button data-range="3" aria-pressed="false">3 anni</button>
+        <button data-range="5" aria-pressed="false">5 anni</button>
+        <button data-range="0" aria-pressed="true">Tutto</button>
+        <select id="bucket" aria-label="Raggruppamento dei dati">
+          <option value="">Ogni rilevazione</option>
+          <option value="W">Per settimana</option>
+          <option value="M">Per mese</option>
+          <option value="Y">Per anno</option>
+        </select>
+        <select id="view" aria-label="Tipo di grafico">
+          <option value="line">Linea e banda</option>
+          <option value="box">Rettangoli min-max</option>
+        </select>
+        <span class="spacer"></span>
+        <button id="csv">Scarica questa serie in CSV</button>
+      </div>
+      <div id="chart"><div id="legend"></div></div>
+      <div class="facts" id="facts"></div>
+      <div class="note" id="note" hidden></div>
+    </div>
+  </main>
+</div>
+</div>
+
+<footer>
+  Dati dei listini delle borse merci; la licenza di ciascuna è nella sua scheda.
+  Ricostruzione non ufficiale: per usi contrattuali fa fede il listino pubblicato dalla fonte.
+</footer>
+
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

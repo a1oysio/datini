@@ -1,0 +1,159 @@
+"""Genera i JSON statici che alimentano il sito su GitHub Pages.
+
+Il sito e' statico: niente backend, niente query.  Serve quindi un indice
+leggero per il catalogo e una serie per prodotto, caricata solo quando l'utente
+la apre -- scaricare i 4 MB del dataset intero per disegnare un grafico sarebbe
+inaccettabile.
+
+Ogni cartella di ``dataset/`` e' una borsa e finisce in ``api/<borsa>/``; in
+cima, ``api/index.json`` le elenca tutte per la prima pagina del sito.  Accanto
+alle serie, ``api/<borsa>/all.csv.gz`` e' l'intera borsa in un file solo, gia'
+unita all'anagrafica: per chi vuole i dati e non il grafico.
+
+    python -m pipeline.publish
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import gzip
+import io
+import json
+import shutil
+from collections import defaultdict
+from pathlib import Path
+
+from pipeline import csvstore, energia, paths
+
+
+def read_exchange(dataset: Path) -> dict:
+    """La scheda della borsa: ``exchange.json`` e' scritto a mano, ``meta.json``
+    lo rigenera la pipeline.  Senza scheda la borsa si pubblica lo stesso, col
+    nome che sta in ``meta.json`` o, in mancanza, con quello della cartella."""
+    path = dataset / "exchange.json"
+    info = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    meta = csvstore.read_meta(dataset / "meta.json")
+    info.setdefault("name", meta.get("exchange_name") or dataset.name)
+    info.setdefault("source_url", meta.get("source_url"))
+    return {**info, "slug": dataset.name, "meta": meta}
+
+
+def find_datasets(root: Path) -> list[Path]:
+    return sorted(d for d in root.iterdir() if (d / "products.csv").is_file())
+
+
+def write_bulk(dataset: Path, out: Path) -> int:
+    """Tutti i prezzi della borsa in un CSV compresso, una riga per (data, codice),
+    con nome, categoria e unita' accanto al codice.  Le colonne dei valori sono
+    quelle di ``prices/``: minimo e massimo, o i quattro prezzi dei petroliferi."""
+    with (dataset / "products.csv").open(encoding="utf-8") as fh:
+        products = {r["code"]: r for r in csv.DictReader(fh)}
+    files = sorted((dataset / "prices").glob("*.csv"))
+    with files[0].open(encoding="utf-8") as fh:
+        values = next(csv.reader(fh))[2:]
+    prices = csvstore.read_prices(dataset / "prices")
+
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(["date", "code", "name", "category_path", "unit", *values])
+    for d, code in sorted(prices, key=lambda k: (k[0], csvstore.sort_key(k[1]))):
+        p = products[code]
+        w.writerow([d, code, p["name"], p["category_path"], p["unit"],
+                    *map(csvstore.fmt, prices[(d, code)])])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # mtime fisso: gli stessi dati danno lo stesso file, come per i CSV.
+    with gzip.GzipFile(out, "wb", mtime=0) as gz:
+        gz.write(buf.getvalue().encode("utf-8"))
+    return len(prices)
+
+
+def publish(dataset: Path, out_dir: Path, exchange: dict) -> dict[str, int]:
+    products = csvstore.read_products(dataset / "products.csv")
+    prices = csvstore.read_prices(dataset / "prices")
+    if dataset.name == energia.SLUG:
+        products, prices = energia.for_site(products, prices)
+
+    series: dict[str, list] = defaultdict(list)
+    # L'ultima riga di ogni voce, quotata o no: dice se e' ancora nel listino.
+    listed: dict[str, str] = {}
+    for (d, code), (low, high) in prices.items():
+        listed[code] = max(listed.get(code, d), d)
+        if low is None and high is None:
+            continue            # non quotato: nel grafico e' un buco, non un punto
+        series[code].append((d, low, high))
+
+    series_dir = out_dir / "series"
+    if series_dir.exists():
+        shutil.rmtree(series_dir)
+    series_dir.mkdir(parents=True, exist_ok=True)
+
+    index = []
+    for code in sorted(products, key=csvstore.sort_key):
+        p = products[code]
+        points = sorted(series.get(code, []))
+        levels = [x for x in p.category_path.split(" > ") if x]
+        index.append({
+            "code": code,
+            "name": p.name,
+            "category": levels[-1] if levels else "",
+            "group": levels[0] if levels else "",
+            "path": p.category_path,
+            "unit": p.unit,
+            "n": len(points),
+            "first": points[0][0] if points else None,
+            "last": points[-1][0] if points else None,
+            "listed": listed.get(code),
+            # Ultima quotazione e quella prima, [minimo, massimo]: l'elenco del
+            # sito mostra il prezzo e la variazione senza scaricare la serie.
+            "now": list(points[-1][1:]) if points else None,
+            "before": list(points[-2][1:]) if len(points) > 1 else None,
+        })
+        if points:
+            (series_dir / f"{code}.json").write_text(
+                json.dumps({"code": code, "unit": p.unit, "name": p.name,
+                            "points": [[d, lo, hi] for d, lo, hi in points]},
+                           separators=(",", ":")),
+                encoding="utf-8",
+            )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "index.json").write_text(
+        json.dumps({"exchange": exchange, "products": index}, ensure_ascii=False,
+                   separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return {"products": len(index), "series": len(list(series_dir.glob('*.json')))}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--datasets", type=Path, default=paths.DATASET_DIR,
+                    help="cartella che contiene una sottocartella per borsa")
+    ap.add_argument("--out", type=Path, default=paths.SITE_API_DIR)
+    args = ap.parse_args()
+
+    exchanges = []
+    for dataset in find_datasets(args.datasets):
+        exchange = read_exchange(dataset)
+        stats = publish(dataset, args.out / dataset.name, exchange)
+        rows = write_bulk(dataset, args.out / dataset.name / "all.csv.gz")
+        exchanges.append(exchange)
+        print(f"  {exchange['name']}")
+        print(f"    prodotti in indice : {stats['products']}")
+        print(f"    serie generate     : {stats['series']}")
+        print(f"    righe in all.csv.gz: {rows}")
+    if not exchanges:
+        print(f"  nessuna borsa in {args.datasets}")
+        return 1
+
+    (args.out / "index.json").write_text(
+        json.dumps({"exchanges": exchanges}, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    size = sum(f.stat().st_size for f in args.out.rglob("*") if f.is_file())
+    print(f"  peso totale        : {size/1024/1024:.1f} MB in {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

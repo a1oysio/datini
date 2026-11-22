@@ -1,0 +1,136 @@
+name: Aggiorna i dati
+
+# La borsa pubblica due o tre bollettini a settimana, in giorni non fissi.
+# Sondare ogni giorno rende l'orario irrilevante: se un giorno il cron di GitHub
+# slitta o salta, l'indomani si recupera da solo.  Ogni esecuzione riscarica
+# anche gli ultimi bollettini gia' acquisiti, perche' la borsa a volte pubblica
+# l'XML prima del PDF ufficiale e poi lo corregge senza cambiare numero.
+on:
+  schedule:
+    # Minuto non tondo: allo scoccare dell'ora GitHub e' sovraccarico e i cron
+    # partono con ore di ritardo o vengono saltati del tutto (successo il
+    # 2026-11-16).  Due passaggi al giorno: se uno salta, c'e' l'altro.
+    - cron: "37 6,19 * * *"
+  workflow_dispatch:
+    inputs:
+      from:
+        description: "Bollettino da cui ripartire (vuoto = dal successivo all'ultimo noto)"
+        required: false
+      recheck:
+        description: "Quanti bollettini gia' acquisiti riscaricare (vuoto = 8)"
+        required: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: dataset
+  cancel-in-progress: false
+
+jobs:
+  aggiorna:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # DATA_PAT, se presente, tiene vivo il cron: GitHub disattiva i
+          # workflow schedulati dopo 60 giorni senza attivita' del repository, e
+          # i commit fatti con GITHUB_TOKEN non sempre contano come attivita'.
+          token: ${{ secrets.DATA_PAT || secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Scarica i bollettini nuovi e ricontrolla i recenti
+        run: |
+          python -m pipeline.update \
+            ${{ inputs.from && format('--from {0}', inputs.from) || '' }} \
+            ${{ inputs.recheck && format('--recheck {0}', inputs.recheck) || '' }}
+
+      # Bologna pubblica PDF: per leggerli serve pdftotext.  Il suo passo non
+      # ferma il resto -- se il sito di AGER non risponde, Verona si aggiorna lo
+      # stesso -- ma il guasto viene fatto valere in fondo, dopo il commit.
+      - name: Installa pdftotext
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends poppler-utils
+
+      - name: Scarica i listini nuovi di Bologna
+        id: bologna
+        continue-on-error: true
+        run: python -m pipeline.update --exchange bologna
+
+      # Foggia: PDF anche qui, stessa regola di Bologna.  Cereali e prodotti
+      # olivicoli in passi separati: un listino illeggibile non ferma l'altro.
+      - name: Scarica i listini nuovi di Foggia
+        id: foggia
+        continue-on-error: true
+        run: python -m pipeline.update --exchange foggia
+
+      - name: Scarica i listini nuovi dei prodotti olivicoli di Foggia
+        id: olivicoli
+        continue-on-error: true
+        run: python -m pipeline.update --exchange foggia-olivicoli
+
+      # Prodotti petroliferi di Verona: stessa regola di Bologna, un guasto qui
+      # non ferma le borse ma fa fallire il workflow dopo il commit.
+      - name: Scarica le rilevazioni nuove dei petroliferi
+        id: energia
+        continue-on-error: true
+        run: python -m pipeline.update --exchange verona-energia
+
+      - name: Valida il dataset
+        run: python -m pipeline.validate
+
+      - name: Pubblica le variazioni
+        run: |
+          if git diff --quiet -- dataset; then
+            echo "Nessun bollettino nuovo: niente da committare."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dataset
+          # Le rettifiche cambiano valori gia' pubblicati: chi ha scaricato il CSV
+          # ieri deve poterlo capire dal messaggio di commit, non dal diff.
+          # Le righe del registro iniziano con la data di rilevamento: contando
+          # solo quelle si esclude l'intestazione della primissima esecuzione.
+          rettifiche=$(git diff --cached -- 'dataset/*/revisions.csv' \
+                       | grep -c '^+[0-9]' || true)
+          messaggio="dati: aggiornamento automatico del $(date -u +%F)"
+          if [ "$rettifiche" -gt 0 ]; then
+            messaggio="$messaggio ($rettifiche rettifiche della fonte)"
+          fi
+          git commit -m "$messaggio"
+          git push
+
+      - name: Fa valere i guasti di Bologna, Foggia (cereali e olivicoli) e dei petroliferi
+        if: steps.bologna.outcome == 'failure' || steps.foggia.outcome == 'failure' || steps.olivicoli.outcome == 'failure' || steps.energia.outcome == 'failure'
+        run: |
+          echo "Bologna: ${{ steps.bologna.outcome }}, Foggia: ${{ steps.foggia.outcome }}, olivicoli: ${{ steps.olivicoli.outcome }}, petroliferi: ${{ steps.energia.outcome }}. Vedi i passi sopra."
+          exit 1
+
+      - name: Segnala il guasto con una issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Una sola issue aperta alla volta: un guasto che dura una settimana
+          # non deve produrre sette segnalazioni identiche.
+          existing=$(gh issue list --label pipeline --state open \
+                       --search "Aggiornamento dati fallito in:title" \
+                       --json number --jq '.[0].number')
+          body="Il workflow di aggiornamento e' fallito il $(date -u +%F).
+
+          Log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Il dataset **non** e' stato modificato: i CSV pubblicati restano quelli
+          dell'ultima esecuzione riuscita."
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "Aggiornamento dati fallito" \
+                            --label pipeline --body "$body"
+          fi

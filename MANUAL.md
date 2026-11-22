@@ -1,0 +1,515 @@
+# Manuale operativo
+
+Come mettere in funzione l'aggiornamento automatico e il sito, e cosa fare
+quando qualcosa non torna.
+
+---
+
+## 1. Attivazione su GitHub (una volta sola)
+
+### 1.0 In che ordine
+
+**Prima il push, poi le impostazioni.** Su un repository vuoto meta' interfaccia
+non e' disponibile: `Settings` → `Pages` spesso non mostra nemmeno il selettore
+della sorgente finche' non esiste un branch, e la scheda `Actions` mostra il
+catalogo dei template invece dei workflow — non sceglierne nessuno, i due
+workflow sono gia' in `.github/workflows/` e GitHub li trova da solo al push.
+
+```bash
+# 1. un repository vuoto (senza README, licenza o .gitignore generati da
+#    GitHub: sono gia' nel progetto e costringerebbero a un merge)
+gh repo create datini --public
+
+# 2. il codice
+git clone https://github.com/a1oysio/datini.git && cd datini
+git remote set-url origin git@github.com:<utente>/datini.git
+git push -u origin main     # il branch DEVE chiamarsi main: i workflow lo citano
+
+# 3. le impostazioni: paragrafi 1.1 - 1.4
+# 4. rilancia il workflow fallito: paragrafo 1.5
+```
+
+Il primo push fa partire `pages.yml` da solo — al primo commit `site/`,
+`dataset/` e `pipeline/` sono tutti percorsi nuovi — e quel primo tentativo
+**fallisce**, perche' Pages non e' ancora configurato. E' atteso: si rilancia a
+mano dopo il paragrafo 1.1.
+
+**Con un fork** i passi 1 e 2 non servono: il codice c'e' gia'. Serve invece un
+passo in piu': GitHub disattiva le Actions sui fork, e i workflow pianificati
+restano fermi finche' non le riattivi dalla scheda `Actions` del fork
+("I understand my workflows, go ahead and enable them"). Poi i paragrafi
+1.1 - 1.4, e lancia `pages.yml` a mano: senza un push non parte da solo.
+
+Link diretti, per non cercarli nei menu:
+
+| Impostazione | Indirizzo |
+|---|---|
+| Permessi | `/settings/actions` |
+| Pages | `/settings/pages` |
+| Secret | `/settings/secrets/actions` |
+| Etichetta | `/labels` |
+
+Il **cron** comincia a contare solo quando il workflow e' sul branch di default:
+prima, per GitHub, non esiste. La prima esecuzione automatica sara' quindi il
+giorno seguente.
+
+### 1.1 Abilita GitHub Pages
+
+`Settings` → `Pages` → **Source: GitHub Actions**.
+
+Non scegliere "Deploy from a branch": i JSON del sito non sono versionati, li
+genera il workflow a ogni deploy. Versionare sia i CSV sia i JSON significherebbe
+committare due volte gli stessi dati.
+
+### 1.2 Dai al workflow il permesso di committare
+
+`Settings` → `Actions` → `General` → `Workflow permissions` →
+**Read and write permissions**.
+
+### 1.3 Crea l'etichetta per le segnalazioni
+
+```bash
+gh label create pipeline --color B60205 --description "Guasti dell'aggiornamento automatico"
+```
+
+Senza questa etichetta il passo che apre la issue in caso di guasto fallisce a
+sua volta, e il guasto resta muto.
+
+### 1.4 Token per tenere vivo il cron — consigliato
+
+GitHub **disattiva i workflow schedulati dopo 60 giorni** senza attività nel
+repository, e i commit fatti con il token predefinito non sempre contano come
+attività. Un repository che aggiorna solo dati rischia quindi di spegnersi da
+solo dopo due mesi.
+
+Rimedio: un token personale a scadenza lunga.
+
+1. `Settings` → `Developer settings` → `Personal access tokens` →
+   `Fine-grained tokens` → `Generate new token`
+2. Repository: solo questo. Permessi: **Contents: Read and write**
+3. Copia il token
+4. Nel repository: `Settings` → `Secrets and variables` → `Actions` →
+   `New repository secret`, nome **`DATA_PAT`**
+
+Il workflow lo usa se c'è e ricade sul token predefinito se manca:
+
+```yaml
+token: ${{ secrets.DATA_PAT || secrets.GITHUB_TOKEN }}
+```
+
+Il token ha un secondo effetto utile: un push fatto con `GITHUB_TOKEN` non
+innesca altri workflow, quindi senza `DATA_PAT` il sito si aggiorna tramite il
+trigger `workflow_run` invece che direttamente sul push.
+
+### 1.5 Prima esecuzione
+
+`Actions` → `Aggiorna i dati` → `Run workflow`.
+
+Verifica poi che `Pubblica il sito` sia partito e che
+`https://<utente>.github.io/datini/` risponda.
+
+Se il dataset e' gia' aggiornato, questa prima esecuzione trovera' **zero
+bollettini nuovi** e non committera' nulla: e' il comportamento corretto, non un
+guasto. Per vedere l'automazione lavorare davvero occorre attendere il
+bollettino successivo; nel frattempo il log del passo di sondaggio mostra quali
+numeri ha provato.
+
+---
+
+## 2. Cosa succede da solo
+
+```
+ogni giorno alle 06:37 e alle 19:37 UTC
+        │
+        ├─ pipeline.update    ┬─ riscarica gli ultimi 8 bollettini già acquisiti
+        │                     │  e adotta i valori che la fonte ha corretto
+        │                     └─ sonda i numeri successivi all'ultimo noto,
+        │                        scarica quelli che esistono, li unisce ai CSV
+        │
+        ├─ pipeline.validate  ┬─ errori → NIENTE commit, apre una issue
+        │                     └─ solo avvisi → prosegue
+        │
+        ├─ git commit         solo se dataset/ è cambiato davvero
+        │
+        └─ Pubblica il sito   rigenera i JSON dai CSV e fa il deploy su Pages
+```
+
+Il sondaggio si ferma dopo **6 numeri consecutivi mancanti**: la borsa salta
+qualche numero (bollettini mensili, settimane di chiusura), quindi il primo 404
+non significa "non c'è altro".
+
+Non tutti i bollettini con una data sono listini. Quelli intitolati "RILEVAZIONE
+N. x DEL 15 …" o "… DEL 30 …" sono le **medie quindicinali**: finiscono in
+`dataset/verona/averages/`, mai in `prices/`, perché il 15 e il 30 possono
+essere giorni di mercato e la media prenderebbe il posto della quotazione vera.
+
+Una quindicina di richieste al giorno, una al secondo, con uno `User-Agent` che
+rimanda al repository.
+
+### Perché tutti i giorni
+
+La borsa pubblica due o tre bollettini a settimana, in giorni non fissi. Sondare
+ogni giorno rende l'orario irrilevante: se un giorno il cron di GitHub slitta o
+salta — succede, il cron di Actions è "best effort" — l'indomani si recupera da
+solo. L'operazione è idempotente: se non c'è niente di nuovo non committa nulla.
+
+### Perché ricontrollare i bollettini già presi
+
+La borsa a volte pubblica l'XML **prima** del bollettino PDF ufficiale, e quella
+prima versione può avere dati incompleti o sbagliati. Nei giorni seguenti l'XML
+viene riallineato al PDF **senza cambiare numero**: leggendo solo i numeri nuovi
+la prima versione resterebbe nei CSV per sempre.
+
+Da qui la finestra di ricontrollo: a ogni esecuzione gli ultimi 8 numeri già
+acquisiti vengono riscaricati e riconfrontati riga per riga. Otto numeri sono
+circa tre settimane — la borsa ne pubblica due o tre a settimana — cioè molto più
+del ritardo con cui il PDF segue l'XML. Costa otto richieste al giorno.
+
+Quando un valore cambia:
+
+- il CSV prende quello nuovo, perché è quello che la fonte considera valido oggi;
+- il vecchio finisce in `dataset/verona/revisions.csv` con data, codice,
+  bollettino e istante del rilevamento;
+- il messaggio di commit lo dice: `(77 rettifiche della fonte)`;
+- `pipeline.validate` lo segnala come avviso, non come errore: non è un guasto
+  nostro.
+
+Chi tiene una copia locale delle ultime settimane deve saperlo: **una riga già
+pubblicata può cambiare**. È la ragione per cui il registro esiste.
+
+---
+
+## 3. Operazioni manuali
+
+Con il virtualenv attivo (`source .venv/bin/activate`).
+
+### Aggiornare adesso, senza aspettare il cron
+
+Da GitHub: `Actions` → `Aggiorna i dati` → `Run workflow`.
+
+In locale:
+
+```bash
+python -m pipeline.update
+python -m pipeline.validate
+git add dataset && git commit -m "dati: aggiornamento manuale"
+```
+
+### Vedere cosa arriverebbe, senza scrivere niente
+
+```bash
+python -m pipeline.update --dry-run
+```
+
+### Ricontrollare più indietro degli 8 numeri di default
+
+Se il sospetto è che una correzione della fonte sia sfuggita — per esempio dopo
+giorni di cron fermo:
+
+```bash
+python -m pipeline.update --recheck 40      # circa tre mesi
+python -m pipeline.update --recheck 0       # solo i numeri nuovi, nessun ricontrollo
+```
+
+Da GitHub è il campo `recheck` di `Run workflow`. Un ricontrollo molto ampio
+costa una richiesta al secondo per numero: `--recheck 400` sono sette minuti.
+
+### Ripartire da un bollettino preciso
+
+Se il sondaggio si è fermato troppo presto, per esempio perché la borsa ha
+saltato più di sei numeri di fila:
+
+```bash
+python -m pipeline.update --from 1450
+```
+
+Da GitHub lo stesso parametro è il campo `from` di `Run workflow`.
+
+### Conservare gli XML scaricati
+
+Di norma i file grezzi vengono buttati dopo il parsing: pesano una cinquantina di
+MB e non sono versionati. Per tenerne un archivio locale:
+
+```bash
+python -m pipeline.update --staging data/verona
+```
+
+### Ricostruire tutto dall'archivio XML
+
+Serve dopo aver toccato il parser o le regole sulle unità di misura: rilegge
+tutti i bollettini e riscrive i CSV da zero.
+
+```bash
+python -m pipeline.rebuild          # da data/verona
+python -m pipeline.validate
+```
+
+Richiede l'archivio completo. Se non ce l'hai, ricostruiscilo — ci vuole una
+mezz'ora, una richiesta al secondo:
+
+```bash
+python -m pipeline.update --from 1 --staging data/verona
+```
+
+L'operazione è deterministica: due esecuzioni sugli stessi file danno CSV
+identici byte per byte. E `rebuild` e `update` producono lo stesso risultato,
+perché scrivono entrambi attraverso `pipeline/csvstore.py`.
+
+### Rigenerare i JSON del sito
+
+```bash
+python -m pipeline.publish
+```
+
+Normalmente non serve: lo fa il workflow a ogni deploy. Utile per provare il sito
+in locale:
+
+```bash
+python -m pipeline.publish
+cd site && python -m http.server 8000
+```
+
+### datapackage.json non allineato
+
+`pipeline.validate` controlla che `dataset/<borsa>/datapackage.json` descriva i
+file che ci sono davvero. La pipeline lo riscrive a ogni aggiornamento; se un
+CSV è stato toccato a mano:
+
+```bash
+python -m pipeline.validate --fix-datapackage
+```
+
+Una colonna nuova va descritta in `csvstore.FIELDS`, altrimenti la validazione
+fallisce.
+
+---
+
+## 4. Il sito
+
+`https://<utente>.github.io/datini/` — catalogo con ricerca, filtri per
+comparto e unità, grafico per prodotto con banda minimo-massimo, statistiche,
+download della singola serie in CSV.
+
+È **statico**: HTML, CSS e JavaScript, senza alcun server. GitHub Pages non
+esegue codice. I dati arrivano da `site/api/`, generato dai CSV al momento del
+deploy:
+
+| File | Contenuto |
+|------|-----------|
+| `site/api/index.json` | elenco delle borse, per la prima pagina |
+| `site/api/<borsa>/index.json` | scheda della borsa e catalogo completo, ~150 KB |
+| `site/api/<borsa>/series/<code>.json` | una serie, scaricata solo quando si apre |
+
+La prima pagina elenca le borse; `?b=<borsa>` apre il catalogo di una,
+`?b=<borsa>&p=<codice>` un prodotto. Una borsa è una cartella di `dataset/` con
+dentro `products.csv`: `pipeline.publish` le pubblica tutte. Quello che il sito
+dice di ciascuna — nome, ente, fonte, descrizione, avvertenze — sta in
+`dataset/<borsa>/exchange.json`, scritto a mano; `meta.json` invece lo rigenera
+la pipeline e non va toccato.
+
+Scaricare i 4 MB dell'intero dataset per disegnare un grafico sarebbe
+inaccettabile: da qui la divisione.
+
+`app.js` e `style.css` arrivano al browser con l'hash del loro contenuto
+nell'indirizzo (`app.js?v=8ed9ab3a`). Pages serve gli asset con `max-age=600`, e
+senza quell'hash dopo un deploy il browser può tenersi per dieci minuti il
+JavaScript vecchio accanto all'HTML nuovo: i controlli si vedono ma non
+rispondono. Lo stamp lo mette `pages.yml` sul runner, subito prima dell'upload,
+quindi nel repository i riferimenti restano puliti. Se un giorno un asset viene
+rinominato e il passo non trova più niente da marchiare, il deploy fallisce
+invece di pubblicare pagine che si romperanno al deploy successivo.
+
+I JSON sotto `api/` non sono marchiati: lì la cache di dieci minuti significa
+soltanto vedere i prezzi di ieri per dieci minuti in più, e si risolve da sé.
+
+Sul grafico si sceglie il **raggruppamento** — ogni rilevazione, per settimana,
+per mese, per anno — e la **forma**: linea con banda, oppure rettangoli
+minimo-massimo. Raggruppando, il minimo e il massimo sono gli estremi toccati nel
+periodo e la linea è la media delle rilevazioni, non il centro della banda: un
+mese con tre settimane a 200 e una a 300 vale 225, non 250.
+
+I rettangoli non sono candele, benché la libreria li disegni con una serie
+`candlestick`. La fonte pubblica un minimo e un massimo di rilevazione, non
+apertura e chiusura: costruire un OHLC vero significherebbe inventare due valori
+su quattro. Apertura e chiusura valgono quindi quanto minimo e massimo, così il
+corpo copre esattamente l'escursione, senza stoppini e con un colore solo — il
+verde/rosso indicherebbe una direzione che la fonte non pubblica.
+
+---
+
+## 5. Quando qualcosa non va
+
+### Il workflow ha aperto una issue
+
+Il dataset **non** è stato toccato: i CSV pubblicati restano quelli dell'ultima
+esecuzione riuscita. Riproduci in locale:
+
+```bash
+python -m pipeline.update --dry-run
+python -m pipeline.validate
+```
+
+### La validazione fallisce
+
+Il gate distingue due cose:
+
+| | Significato | Effetto |
+|---|---|---|
+| **Errore** | La nostra pipeline si è rotta | Blocca la pubblicazione |
+| **Avviso** | La fonte ha pubblicato qualcosa di strano | Si segnala e si prosegue |
+
+Sono errori: CSV malformato, data illeggibile, codice assente dal catalogo,
+coppia (data, codice) duplicata, unità sconosciuta, prezzo negativo o nullo,
+numero di righe che diminuisce.
+
+Sono avvisi: minimo maggiore del massimo, valori oltre dieci volte la mediana
+storica, prodotti mai quotati, rettifiche fatte dalla fonte.
+
+Un'**unità sconosciuta** è quasi sempre una categoria nuova con una dicitura mai
+vista: aggiungi il pattern in `exchanges/verona/units.py`, poi `rebuild`.
+
+Un **calo del numero di righe** significa che il parser ha smesso di riconoscere
+qualcosa. Non forzare il commit: capisci prima cosa è cambiato nella fonte.
+
+### Un prezzo già pubblicato è cambiato
+
+Guarda `dataset/verona/revisions.csv`: se la riga c'è, è la borsa che ha
+riallineato l'XML al bollettino PDF, e il valore nuovo è quello buono. Se la riga
+**non** c'è ed è cambiata lo stesso, allora è la pipeline ad aver fatto qualcosa
+di imprevisto, e va indagata.
+
+### Il cron ha smesso di partire
+
+Quasi certamente i 60 giorni di inattività (§ 1.4). In `Actions` il workflow
+appare disabilitato, con un pulsante per riattivarlo. Configura `DATA_PAT`
+perché non succeda più.
+
+### Il sito non si aggiorna
+
+Controlla che `Pubblica il sito` sia partito. È innescato dal push su `dataset/`
+e, in assenza di `DATA_PAT`, dal trigger `workflow_run` al termine di
+`Aggiorna i dati`. Si può sempre lanciare a mano da `Actions`.
+
+---
+
+## 6. Rapporto con agx-scraper
+
+Il parser di Verona è condiviso con [agx-scraper](https://github.com/a1oysio/agx-scraper),
+uno strumento locale per ispezionare i dati e sperimentare nuove borse.
+
+Quattro file sono **copie identiche**, e un `diff` basta a vedere se hanno preso
+strade diverse:
+
+```
+exchanges/verona/parser.py
+exchanges/verona/processors.py
+exchanges/verona/units.py
+exchanges/verona/fetcher.py     ← tranne lo User-Agent, che indica questo repo
+```
+
+Due file differiscono per costruzione:
+
+- `exchanges/__init__.py` — qui contiene solo i dataclass `PriceRecord` e
+  `FileMetadata`, senza la classe base degli adapter né il registro, che servono
+  soltanto all'app Flask;
+- `exchanges/verona/__init__.py` — qui è vuoto, là contiene l'adapter.
+
+**Questo repository è quello autorevole** per il parser di Verona. Le correzioni
+si fanno qui e semmai si riportano in agx-scraper, non il contrario.
+
+---
+
+## 7. Aggiungere un'altra borsa
+
+Le fonti sono quattro e fatte diversamente, quindi ognuna ha la sua strada fino ai
+CSV; da lì in poi (validazione, pubblicazione, sito) è tutto comune.
+
+| | Verona | Bologna | Foggia | Petroliferi di Verona |
+|---|---|---|---|---|
+| Fonte | XML, un indirizzo per numero | PDF, elencati in una pagina | PDF, elencati in una pagina | XML, numeri presi dall'indice della pagina |
+| Codice in `exchanges/` | `verona/` | `bologna/` | `foggia/` | `verona/energia.py` |
+| Aggiornamento | `python -m pipeline.update` | `… --exchange bologna` | `… --exchange foggia` | `… --exchange verona-energia` |
+| Ricostruzione | `python -m pipeline.rebuild` | `… --exchange bologna` | `… --exchange foggia` | `… --exchange verona-energia` |
+| Logica | `pipeline/update.py`, `rebuild.py` | `pipeline/bologna.py` | `pipeline/bologna.py` (via `pipeline/foggia.py`) | `pipeline/energia.py` |
+| Archivio locale | `data/verona/*.xml` | `data/bologna/<anno>/*.pdf` | `data/foggia/<anno>/*.pdf` | `data/verona-energia/*.xml` |
+
+`pipeline.validate` e `pipeline.publish` lavorano su tutte le cartelle di
+`dataset/`. Il workflow aggiorna prima Verona, poi Bologna, Foggia e i
+petroliferi; se uno di questi fallisce Verona viene pubblicata lo stesso e il
+guasto apre comunque la issue.
+
+I petroliferi hanno uno schema dei prezzi diverso (netto, con accisa, IVA, al
+consumo invece di minimo e massimo): `pipeline.validate` riconosce i due schemi
+dall'intestazione, e `pipeline.publish` trasforma ogni prezzo in una voce del
+sito con minimo = massimo (`energia.for_site`). La numerazione è condivisa con la
+borsa merci: lo stesso numero su `borsa-merci/` è una media quindicinale, per
+questo l'archivio è in una cartella a parte. Per ricostruirlo:
+
+```bash
+python -m exchanges.verona.energia --dest data/verona-energia   # ~260 file, ~5 minuti
+python -m pipeline.rebuild --exchange verona-energia
+```
+
+### Bologna: quando il listino cambia impaginazione
+
+I PDF si leggono con `pdftotext` (pacchetto `poppler-utils`), usando la posizione
+delle parole sulla pagina. La parte che non cambia — trovare la testata "min max
+min max", incolonnare i prezzi — è in `exchanges/bologna/table.py`. Quello che
+cambia da un'epoca all'altra — come si riconosce un titolo, dove finisce la
+tabella — è in `exchanges/bologna/layouts/`, un file per epoca:
+
+| File | Vale da | Formato |
+|---|---|---|
+| `a3.py` | 2004 | un foglio, tre tabelle affiancate |
+| `a4.py` | 9 giugno 2016 | più pagine, una tabella per pagina |
+
+Se un giorno la lettura si rompe o comincia a produrre voci strane, **non si
+modifica un lettore esistente**: si aggiunge un file con una sottoclasse di
+quello più vicino, la si registra in `layouts/__init__.py` con la data da cui
+vale, e gli anni prima restano letti esattamente come prima. Poi:
+
+```bash
+python -m exchanges.bologna.fetcher --dest data/bologna   # archivio PDF, ~1 ora
+python -m pipeline.rebuild --exchange bologna
+git diff --stat dataset/bologna       # deve cambiare solo quello che ci si aspetta
+```
+
+Le voci di Bologna non sono raggruppate: vedi `dataset/bologna/README.md`.
+
+### Foggia
+
+Foggia passa per la stessa strada di Bologna (`pipeline/bologna.py`, con
+`Source`): cambiano solo l'elenco (`exchanges/foggia/fetcher.py`) e la lettura
+del PDF (`exchanges/foggia/parser.py`). Il listino è un foglio Excel: i nomi
+vanno a capo dentro la cella e si riattaccano ai prezzi per vicinanza; il
+docstring del parser spiega le regole. Se compare una voce strana, il primo
+sospetto è un sottotitolo nuovo da aggiungere a `_SUB` nel parser.
+
+```bash
+python -m exchanges.foggia.fetcher --dest data/foggia     # ~250 PDF, ~25 minuti
+python -m pipeline.rebuild --exchange foggia
+```
+
+Il listino dei prodotti olivicoli (dall'ottobre 2024) è un secondo dataset,
+`dataset/foggia-olivicoli/`, con lo stesso parser e un'altra cartella della
+fonte (`exchanges/foggia/olivicoli.py`):
+
+```bash
+python -m exchanges.foggia.olivicoli --dest data/foggia-olivicoli   # ~100 PDF
+python -m pipeline.rebuild --exchange foggia-olivicoli
+```
+
+### Una terza borsa
+
+Perché un'altra borsa arrivi fino ai CSV serve:
+
+1. il nuovo modulo in `exchanges/<nome>/`, che restituisca `PriceRecord` con
+   `category_path` e `units` **corretti** — mai un'unità fissa: a Verona oltre
+   metà delle rilevazioni non è in euro/tonnellata;
+2. un modulo `pipeline/<nome>.py` con il suo aggiornamento e la sua
+   ricostruzione, sul modello di `pipeline/bologna.py`, e la voce in
+   `--exchange` di `pipeline/update.py` e `pipeline/rebuild.py`;
+3. un passo nel workflow `update-data.yml`;
+4. scrivere `dataset/<nome>/exchange.json` sul modello di quello di Verona: il
+   sito e `pipeline.publish` sono già multi-borsa, la nuova cartella compare da
+   sola in prima pagina.

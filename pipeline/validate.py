@@ -1,0 +1,300 @@
+"""Gate di qualita' sui CSV pubblicati.
+
+Gira in CI prima del commit: se trova un errore il workflow non pubblica nulla e
+apre una issue.  Serve perche' la pipeline scrive senza supervisione umana, e un
+parser che si rompe in silenzio e' peggio di un parser che si ferma.
+
+    python -m pipeline.validate          # 0 = ok, 1 = errori
+
+Le anomalie sono divise in errori (bloccano) e avvisi (si segnalano soltanto):
+un dato assurdo puo' essere assurdo alla fonte, e in quel caso va pubblicato
+com'e' e segnalato, non corretto di nascosto.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import statistics
+import sys
+from collections import defaultdict
+from datetime import date, timedelta
+from pathlib import Path
+
+from pipeline import csvstore, paths
+
+VALID_UNITS = {
+    "EUR/t", "EUR/kg", "EUR/100kg", "EUR/L", "EUR/1000L",
+    "EUR/grado-hL", "EUR/grado-100kg", "EUR/100pz", "unknown",
+    "EUR/m3", "EUR/bombola",                # prodotti petroliferi
+}
+
+# Le colonne dopo date e code: un minimo e un massimo per le borse, i quattro
+# valori della rilevazione per i prodotti petroliferi (pipeline/energia.py).
+RANGE = ("low", "high")
+ENERGY = ("price", "price_with_excise", "vat_rate", "consumer_price")
+
+# Un prezzo che si scosta dalla mediana storica del suo prodotto di piu' di
+# questo fattore e' quasi sempre un errore di scala alla fonte.  Riferimento:
+# le olive per olio d.o.p. hanno mediana 1,15-1,40 EUR/kg ma fra ottobre e
+# dicembre 2022 la borsa le ha pubblicate fra 70 e 140.
+OUTLIER_FACTOR = 10.0
+MIN_HISTORY_FOR_OUTLIER = 12
+FIRST_PLAUSIBLE_DATE = date(2000, 1, 1)
+
+# La borsa data il listino al giorno della rilevazione e lo pubblica prima: un
+# bollettino scaricato oggi puo' portare legittimamente la data della settimana
+# entrante.  Oltre questo margine, pero', e' un anno o un mese letto male.
+FUTURE_TOLERANCE_DAYS = 15
+
+
+class Report:
+    def __init__(self) -> None:
+        self.errors: list[str] = []
+        self.warnings: list[str] = []
+
+    def error(self, msg: str) -> None:
+        self.errors.append(msg)
+
+    def warn(self, msg: str) -> None:
+        self.warnings.append(msg)
+
+    def render(self) -> str:
+        out = []
+        if self.errors:
+            out.append(f"ERRORI ({len(self.errors)}):")
+            out += [f"  ✗ {e}" for e in self.errors[:40]]
+            if len(self.errors) > 40:
+                out.append(f"  … e altri {len(self.errors) - 40}")
+        if self.warnings:
+            out.append(f"AVVISI ({len(self.warnings)}):")
+            out += [f"  ! {w}" for w in self.warnings[:40]]
+            if len(self.warnings) > 40:
+                out.append(f"  … e altri {len(self.warnings) - 40}")
+        if not self.errors and not self.warnings:
+            out.append("Nessuna anomalia.")
+        return "\n".join(out)
+
+
+def _read_products(path: Path, rep: Report) -> dict[str, dict]:
+    products: dict[str, dict] = {}
+    with path.open(encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            code = row["code"]
+            if code in products:
+                rep.error(f"products.csv: codice duplicato '{code}'")
+            if row["unit"] not in VALID_UNITS:
+                rep.error(f"products.csv: unita' ignota '{row['unit']}' per il codice {code}")
+            if row["unit"] == "unknown":
+                rep.warn(f"codice {code}: unita' non determinata")
+            products[code] = row
+    return products
+
+
+def _read_prices(dir_: Path, products: dict[str, dict], rep: Report):
+    seen: set[tuple[str, str]] = set()
+    series: dict[str, list[tuple[str, float]]] = defaultdict(list)
+    total = 0
+
+    for csv_file in sorted(dir_.glob("*.csv")):
+        year = csv_file.stem
+        with csv_file.open(encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            cols = tuple(reader.fieldnames or ())[2:]
+            if (reader.fieldnames or [])[:2] != ["date", "code"] or cols not in (RANGE, ENERGY):
+                rep.error(f"{dir_.name}/{csv_file.name}: intestazione inattesa {reader.fieldnames}")
+                continue
+            for n, row in enumerate(reader, start=2):
+                total += 1
+                where = f"{dir_.name}/{csv_file.name}:{n}"
+                try:
+                    d = date.fromisoformat(row["date"])
+                except ValueError:
+                    rep.error(f"{where}: data non valida '{row['date']}'")
+                    continue
+                if str(d.year) != year:
+                    rep.error(f"{where}: data {d} nel file dell'anno {year}")
+                horizon = date.today() + timedelta(days=FUTURE_TOLERANCE_DAYS)
+                if d < FIRST_PLAUSIBLE_DATE or d > horizon:
+                    rep.error(f"{where}: data fuori intervallo plausibile ({d})")
+
+                code = row["code"]
+                if code not in products:
+                    rep.error(f"{where}: codice {code} assente da products.csv")
+                key = (row["date"], code)
+                if key in seen:
+                    rep.error(f"{where}: coppia (data, codice) duplicata {key}")
+                seen.add(key)
+
+                v = {c: float(row[c]) if row[c] else None for c in cols}
+                # Il parser converte zeri e negativi in campi vuoti: se ne
+                # ricompare uno, e' la nostra pipeline ad essersi rotta.
+                for c, x in v.items():
+                    if x is not None and x <= 0:
+                        rep.error(f"{where}: {c} non positivo ({x})")
+                if cols == ENERGY:
+                    # Netto, con accisa, al consumo: ogni passo aggiunge una tassa.
+                    chain = [v["price"], v["price_with_excise"], v["consumer_price"]]
+                    if None not in chain and not chain[0] <= chain[1] <= chain[2]:
+                        rep.warn(f"{where}: prezzi non crescenti netto/accisa/consumo {chain}")
+                    if v["price"] is not None:
+                        series[code].append((row["date"], v["price"]))
+                    continue
+                lo, hi = v["low"], v["high"]
+                if lo is not None and hi is not None and lo > hi:
+                    # Errore della fonte, non nostro: capita che la borsa
+                    # pubblichi una coppia incoerente (2022-03-30, codice 672:
+                    # 480/250 fra vicini a 480/490).  Va segnalato, non deve
+                    # bloccare la pubblicazione per sempre.
+                    rep.warn(f"{where}: minimo {lo} maggiore del massimo {hi}")
+                if lo is not None and hi is not None:
+                    series[code].append((row["date"], (lo + hi) / 2))
+    return total, series
+
+
+def _check_outliers(series, rep: Report) -> None:
+    for code, points in series.items():
+        if len(points) < MIN_HISTORY_FOR_OUTLIER:
+            continue
+        med = statistics.median(v for _, v in points)
+        if med <= 0:
+            continue
+        odd = [(d, v) for d, v in points
+               if v > med * OUTLIER_FACTOR or v < med / OUTLIER_FACTOR]
+        if odd:
+            span = f"{min(d for d, _ in odd)}…{max(d for d, _ in odd)}"
+            rep.warn(
+                f"codice {code}: {len(odd)} valori oltre {OUTLIER_FACTOR:g}x "
+                f"dalla mediana {med:.2f} ({span})"
+            )
+
+
+def _check_revisions(path: Path, products: dict[str, dict], rep: Report) -> int:
+    """Il registro delle rettifiche della fonte: c'e' solo se ne sono state viste."""
+    if not path.exists():
+        return 0
+    n = 0
+    with path.open(encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        cols = RANGE if "low_old" in (reader.fieldnames or ()) else ENERGY
+        expected = (["detected_at", "issue", "date", "code"]
+                    + [f"{c}_old" for c in cols] + [f"{c}_new" for c in cols])
+        if reader.fieldnames != expected:
+            rep.error(f"revisions.csv: intestazione inattesa {reader.fieldnames}")
+            return 0
+        for row_n, row in enumerate(reader, start=2):
+            n += 1
+            where = f"revisions.csv:{row_n}"
+            try:
+                date.fromisoformat(row["date"])
+            except ValueError:
+                rep.error(f"{where}: data non valida '{row['date']}'")
+            if row["code"] not in products:
+                rep.error(f"{where}: codice {row['code']} assente da products.csv")
+            if all(row[f"{c}_old"] == row[f"{c}_new"] for c in cols):
+                rep.error(f"{where}: rettifica senza differenza")
+    return n
+
+
+def _check_no_regression(meta_file: Path, total: int, rep: Report) -> None:
+    """Il dataset puo' solo crescere: un calo segnala un parser che si e' rotto."""
+    if not meta_file.exists():
+        return
+    previous = json.loads(meta_file.read_text(encoding="utf-8")).get("n_observations")
+    if previous is not None and total < previous:
+        rep.error(
+            f"il dataset e' passato da {previous} a {total} osservazioni: "
+            f"mancano {previous - total} righe"
+        )
+
+
+def _package_args(dataset: Path) -> tuple:
+    """Titolo, fonte e licenza come li ha scritti write_meta."""
+    meta = csvstore.read_meta(dataset / "meta.json")
+    return (meta.get("exchange_name") or dataset.name, meta.get("source_url"),
+            meta.get("license"))
+
+
+def _check_datapackage(dataset: Path, rep: Report) -> None:
+    """datapackage.json lo riscrive csvstore.write_meta: se non corrisponde ai
+    file, qualcuno li ha toccati senza passare dalla pipeline."""
+    want = csvstore.datapackage(dataset, *_package_args(dataset))
+    path = dataset / "datapackage.json"
+    if not path.exists() or json.loads(path.read_text(encoding="utf-8")) != want:
+        rep.error("datapackage.json mancante o non allineato ai CSV: "
+                  "rigeneralo con python -m pipeline.validate --fix-datapackage")
+    for res in want["resources"]:
+        for f in res["schema"]["fields"]:
+            if not f["description"]:
+                rep.error(f"{res['name']}: colonna '{f['name']}' senza descrizione "
+                          f"in csvstore.FIELDS")
+
+
+def validate(dataset: Path) -> Report:
+    rep = Report()
+    products_file = dataset / "products.csv"
+    prices = dataset / "prices"
+
+    if not products_file.exists():
+        rep.error(f"manca {products_file}")
+        return rep
+    if not prices.is_dir() or not any(prices.glob("*.csv")):
+        rep.error(f"nessun CSV di prezzi in {prices}")
+        return rep
+
+    products = _read_products(products_file, rep)
+    total, series = _read_prices(prices, products, rep)
+    _check_outliers(series, rep)
+
+    # Le medie quindicinali stanno in una serie a parte e hanno la stessa forma:
+    # stessi controlli riga per riga, niente di piu'.
+    averages = dataset / "averages"
+    if averages.is_dir():
+        _read_prices(averages, products, rep)
+    _check_no_regression(dataset / "meta.json", total, rep)
+    _check_datapackage(dataset, rep)
+
+    # Le rettifiche non sono un guasto -- e' la fonte che si corregge -- ma un
+    # numero insolito in una sola tornata merita un'occhiata: sono valori gia'
+    # pubblicati che cambiano sotto i piedi di chi ha scaricato il CSV ieri.
+    revisions = _check_revisions(dataset / "revisions.csv", products, rep)
+    if revisions:
+        rep.warn(f"registro rettifiche: {revisions} valori corretti dalla fonte "
+                 f"dopo la prima pubblicazione")
+
+    orphans = set(products) - {c for c in series} - {
+        c for c in products if products[c]["n_observations"] == "0"
+    }
+    for code in sorted(orphans, key=lambda c: int(c) if c.isdigit() else 0):
+        if products[code]["n_quoted"] == "0":
+            rep.warn(f"codice {code}: nessuna quotazione, solo righe vuote")
+    return rep
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--dataset", type=Path, default=None,
+                    help="una sola borsa (default: tutte le cartelle di dataset/)")
+    ap.add_argument("--fix-datapackage", action="store_true",
+                    help="riscrive datapackage.json dai CSV e da meta.json, poi valida")
+    args = ap.parse_args()
+
+    datasets = [args.dataset] if args.dataset else sorted(
+        d for d in paths.DATASET_DIR.iterdir() if (d / "products.csv").is_file())
+    failed = 0
+    for dataset in datasets:
+        if args.fix_datapackage:
+            csvstore.write_datapackage(dataset, *_package_args(dataset))
+        rep = validate(dataset)
+        print(f"== {dataset.name}")
+        print(rep.render())
+        if rep.errors:
+            print(f"\nValidazione FALLITA: {len(rep.errors)} errori.", file=sys.stderr)
+            failed += 1
+        else:
+            print(f"\nValidazione superata ({len(rep.warnings)} avvisi).")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
