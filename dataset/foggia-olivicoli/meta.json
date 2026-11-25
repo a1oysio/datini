@@ -3,18 +3,18 @@
   "exchange_name": "Prodotti olivicoli di Foggia",
   "source_url": "https://www.fg.camcom.gov.it/servizi/storico-dei-listini-settimanali",
   "license": "Listini pubblici della Camera di Commercio di Foggia, riutilizzabili citando la fonte",
-  "generated_at": "2026-11-23T00:27:29+00:00",
-  "last_issue_number": 44,
+  "generated_at": "2026-11-25T17:34:27+00:00",
+  "last_issue_number": 45,
   "first_date": "2024-10-09",
-  "last_date": "2026-11-18",
+  "last_date": "2026-11-25",
   "n_products": 18,
-  "n_observations": 1734,
-  "n_quoted": 491,
+  "n_observations": 1751,
+  "n_quoted": 501,
   "n_averages": 0,
   "n_revisions": 0,
   "observations_per_year": {
     "2024": 187,
     "2025": 799,
-    "2026": 748
+    "2026": 765
   }
 }
